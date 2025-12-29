@@ -5,7 +5,7 @@
     Various util + deployment scripts
     <br />
     <br />
-    <a href="https://www.gnu.org/software/bash/manual"><img alt="Bash" src="https://img.shields.io/badge/Bash-000?logo=gnubash&logoColor=white"></a>
+    <a href="https://www.gnu.org/software/bash/manual"><img alt="Shell" src="https://img.shields.io/badge/Shell-000?logo=gnubash&logoColor=white"></a>
   </p>
 </div>
 
