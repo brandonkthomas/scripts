@@ -14,3 +14,7 @@
 Utility for creating a Windows bootable USB from a Windows installation ISO on a macOS host
 
 Dependencies: brew, winlib, rsync (installed automatically if not found)
+
+## More Scripts
+
+- [brandonkthomas/BulkFileOrganizer](https://github.com/brandonkthomas/BulkFileOrganizer)
