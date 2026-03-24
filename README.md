@@ -13,7 +13,13 @@
 
 Utility for creating a Windows bootable USB from a Windows installation ISO on a macOS host
 
-Dependencies: brew, winlib, rsync (installed automatically if not found)
+Dependencies: brew, winlib, rsync *(installed automatically if not found)*
+
+## macos-deploy-helper.zsh
+
+Commonly used macOS system configuration preferences
+
+Dependencies: *none*
 
 ## More Scripts
 
