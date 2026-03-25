@@ -30,9 +30,9 @@ Inputs:
 Options:
   --scheme gpt|mbr       Partition scheme for the USB (GUID for UEFI and MBR for legacy).
                          Default: gpt
-  --name NAME            Volume name to format the USB as. 
+  --name NAME            Volume name to format the USB as.
                          Default: WIN11
-  --split-size-mb N      Chunk size (MB) for install.wim splitting. Must be < 4000 for FAT32. 
+  --split-size-mb N      Chunk size (MB) for install.wim splitting. Must be < 4000 for FAT32.
                          Default: 3500
   --force                Do not prompt for confirmation before erasing the USB
   -h, --help             Show help
@@ -62,16 +62,41 @@ die() {
 }
 
 # ---------------------------------------------------------------------------------------------
-# Minimal TUI (progress)
+# Progress bar
 # ---------------------------------------------------------------------------------------------
 
 UI_IS_TTY=0
 if [[ -t 1 ]]; then UI_IS_TTY=1; fi
 
 UI_TOTAL_STEPS=12
-UI_SPINNER_PID=""
-UI_SPINNER_ACTIVE_STEP=""
-UI_SPINNER_STATUS_FILE=""
+UI_ACTIVE_STEP="0"
+UI_ACTIVE_MSG=""
+UI_PROGRESS_RESERVED_LINE=0
+UI_BAR_CHAR='|'
+UI_EMPTY_CHAR=' '
+UI_DASHBOARD_INITIALIZED=0
+UI_OVERVIEW_PRINTED=0
+UI_DASHBOARD_ANCHOR_SAVED=0
+
+# 1-based step metadata/state arrays
+UI_STEP_TITLE=(
+  ""
+  "Validating inputs"
+  "Checking Homebrew"
+  "Checking wimlib"
+  "Checking rsync (needs 3.x)"
+  "Unmounting USB (if mounted)"
+  "Erasing and formatting USB"
+  "Waiting for USB to mount"
+  "Mounting ISO (read-only)"
+  "Copying ISO files"
+  "Handling install image"
+  "Detaching ISO"
+  "Ejecting USB"
+)
+UI_STEP_STATUS=("" "pending" "pending" "pending" "pending" "pending" "pending" "pending" "pending" "pending" "pending" "pending" "pending")
+UI_STEP_PERCENT=("" "0" "0" "0" "0" "0" "0" "0" "0" "0" "0" "0" "0")
+UI_STEP_DETAIL=("" "" "" "" "" "" "" "" "" "" "" "" "")
 
 # ---------------------------------------------------------------------------------------------
 # ui__step_label
@@ -112,41 +137,20 @@ ui_live_start() {
   local step="$1"
   local msg="$2"
 
-  UI_SPINNER_ACTIVE_STEP="$step"
-
-  # Stop any existing spinner
-  if [[ -n "${UI_SPINNER_PID}" ]]; then
-    kill "${UI_SPINNER_PID}" >/dev/null 2>&1 || true
-    wait "${UI_SPINNER_PID}" >/dev/null 2>&1 || true
-    UI_SPINNER_PID=""
-  fi
-  if [[ -n "${UI_SPINNER_STATUS_FILE}" && -f "${UI_SPINNER_STATUS_FILE}" ]]; then
-    rm -f "${UI_SPINNER_STATUS_FILE}" >/dev/null 2>&1 || true
-  fi
-
-  UI_SPINNER_STATUS_FILE="$(mktemp -t win11usb.status.XXXXXX)"
-  printf "%s" "$msg" >"${UI_SPINNER_STATUS_FILE}"
+  UI_ACTIVE_STEP="$step"
+  UI_ACTIVE_MSG="$msg"
+  UI_STEP_TITLE[$step]="$msg"
+  UI_STEP_STATUS[$step]="running"
+  UI_STEP_PERCENT[$step]="0"
+  UI_STEP_DETAIL[$step]="working"
 
   if (( ! UI_IS_TTY )); then
     ui__println "$(ui__step_label "$step") $msg"
     return 0
   fi
 
-  (
-    local frames='|/-\'
-    local i=0
-    while true; do
-      local f="${frames:i%4:1}"
-      local cur=""
-      if [[ -n "${UI_SPINNER_STATUS_FILE}" && -f "${UI_SPINNER_STATUS_FILE}" ]]; then
-        cur="$(cat "${UI_SPINNER_STATUS_FILE}" 2>/dev/null || true)"
-      fi
-      printf "\r\033[2K%s %s %s" "$(ui__step_label "$step")" "$f" "$cur"
-      sleep 0.12
-      i=$((i+1))
-    done
-  ) &
-  UI_SPINNER_PID="$!"
+  ui_progress_clear
+  ui_progress_render "$step" "$msg"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -154,8 +158,18 @@ ui_live_start() {
 # ---------------------------------------------------------------------------------------------
 ui_live_set() {
   local msg="$1"
-  if [[ -n "${UI_SPINNER_STATUS_FILE}" ]]; then
-    printf "%s" "$msg" >"${UI_SPINNER_STATUS_FILE}" 2>/dev/null || true
+  UI_ACTIVE_MSG="$msg"
+
+  if [[ -n "${UI_ACTIVE_STEP}" && "${UI_ACTIVE_STEP}" != "0" ]]; then
+    UI_STEP_DETAIL[$UI_ACTIVE_STEP]="$msg"
+
+    if [[ "$msg" =~ ([0-9]{1,3})% ]]; then
+      UI_STEP_PERCENT[$UI_ACTIVE_STEP]="${BASH_REMATCH[1]}"
+    fi
+
+    if (( UI_IS_TTY )); then
+      ui_progress_render "$UI_ACTIVE_STEP" "$msg"
+    fi
   fi
 }
 
@@ -166,17 +180,19 @@ ui_live_stop_ok() {
   local step="$1"
   local msg="$2"
 
-  if [[ -n "${UI_SPINNER_PID}" ]]; then
-    kill "${UI_SPINNER_PID}" >/dev/null 2>&1 || true
-    wait "${UI_SPINNER_PID}" >/dev/null 2>&1 || true
-    UI_SPINNER_PID=""
-  fi
-  if [[ -n "${UI_SPINNER_STATUS_FILE}" && -f "${UI_SPINNER_STATUS_FILE}" ]]; then
-    rm -f "${UI_SPINNER_STATUS_FILE}" >/dev/null 2>&1 || true
-  fi
-  UI_SPINNER_STATUS_FILE=""
+  UI_ACTIVE_STEP="$step"
+  UI_ACTIVE_MSG="$msg"
+  UI_STEP_TITLE[$step]="$msg"
+  UI_STEP_STATUS[$step]="done"
+  UI_STEP_PERCENT[$step]="100"
+  UI_STEP_DETAIL[$step]="done"
 
-  ui__clear_line
+  if (( UI_IS_TTY )); then
+    ui_progress_clear
+    ui__println "$(ui__step_label "$step") $msg - done"
+    return 0
+  fi
+
   ui__println "$(ui__step_label "$step") $msg - done"
 }
 
@@ -187,18 +203,108 @@ ui_live_stop_fail() {
   local step="$1"
   local msg="$2"
 
-  if [[ -n "${UI_SPINNER_PID}" ]]; then
-    kill "${UI_SPINNER_PID}" >/dev/null 2>&1 || true
-    wait "${UI_SPINNER_PID}" >/dev/null 2>&1 || true
-    UI_SPINNER_PID=""
-  fi
-  if [[ -n "${UI_SPINNER_STATUS_FILE}" && -f "${UI_SPINNER_STATUS_FILE}" ]]; then
-    rm -f "${UI_SPINNER_STATUS_FILE}" >/dev/null 2>&1 || true
-  fi
-  UI_SPINNER_STATUS_FILE=""
+  UI_ACTIVE_STEP="$step"
+  UI_ACTIVE_MSG="$msg - FAILED"
+  UI_STEP_TITLE[$step]="$msg"
+  UI_STEP_STATUS[$step]="failed"
+  UI_STEP_DETAIL[$step]="FAILED"
 
-  ui__clear_line
+  if (( UI_IS_TTY )); then
+    ui_progress_clear
+    ui__println "$(ui__step_label "$step") $msg - FAILED"
+    return 0
+  fi
+
   ui__println "$(ui__step_label "$step") $msg - FAILED"
+}
+
+# ---------------------------------------------------------------------------------------------
+# ui_progress_init
+# ---------------------------------------------------------------------------------------------
+ui_progress_init() {
+  if (( ! UI_IS_TTY )); then
+    return 0
+  fi
+
+  if (( UI_OVERVIEW_PRINTED == 1 )); then
+    return 0
+  fi
+
+  local i
+  # ui__println "Planned steps:"
+  # for ((i = 1; i <= UI_TOTAL_STEPS; i++)); do
+  #   ui__println "  [ ] $(ui__step_label "$i") ${UI_STEP_TITLE[$i]}"
+  # done
+  # ui__println ""
+
+  UI_OVERVIEW_PRINTED=1
+  UI_DASHBOARD_INITIALIZED=1
+}
+
+# ---------------------------------------------------------------------------------------------
+# ui_progress_clear
+# ---------------------------------------------------------------------------------------------
+ui_progress_clear() {
+  if (( UI_IS_TTY )); then
+    printf '\r\033[2K'
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------
+# ui_progress_render <current_complete_steps> <msg>
+# ---------------------------------------------------------------------------------------------
+ui_progress_render() {
+  local current_step="$1"
+  local msg="$2"
+
+  if (( ! UI_IS_TTY )); then
+    return 0
+  fi
+
+  ui_progress_init
+
+  local columns="${COLUMNS:-80}"
+  if command -v tput >/dev/null 2>&1; then
+    columns="$(tput cols 2>/dev/null || printf '%s' "$columns")"
+  fi
+
+  local percent="0"
+  if [[ -n "${UI_STEP_PERCENT[$current_step]-}" ]]; then
+    percent="${UI_STEP_PERCENT[$current_step]}"
+  fi
+  if ! [[ "$percent" =~ ^[0-9]+$ ]]; then
+    percent=0
+  fi
+  if (( percent < 0 )); then percent=0; fi
+  if (( percent > 100 )); then percent=100; fi
+
+  local suffix=" $(ui__step_label "$current_step") ${msg}"
+  local suffix_max=$((columns / 2))
+  if (( suffix_max < 20 )); then
+    suffix_max=20
+  fi
+  if (( ${#suffix} > suffix_max )); then
+    suffix=" $(ui__step_label "$current_step") ${msg:0:$((suffix_max - 10))}..."
+  fi
+
+  local length=$((columns - ${#suffix} - 10))
+  if (( length < 10 )); then
+    length=10
+  fi
+
+  local num_bars=$((percent * length / 100))
+  local i
+  local s='['
+
+  for ((i = 0; i < num_bars; i++)); do
+    s+=$UI_BAR_CHAR
+  done
+  for ((i = num_bars; i < length; i++)); do
+    s+=$UI_EMPTY_CHAR
+  done
+
+  s+=']'
+  printf '\r\033[2K%s %3s%%%s' "$s" "$percent" "$suffix"
 }
 
 # ---------------------------------------------------------------------------------------------
@@ -554,15 +660,8 @@ LOG_KEEP="0"
 cleanup() {
   set +e
 
-  # Stop spinner if still running
-  if [[ -n "${UI_SPINNER_PID}" ]]; then
-    kill "${UI_SPINNER_PID}" >/dev/null 2>&1 || true
-    wait "${UI_SPINNER_PID}" >/dev/null 2>&1 || true
-    UI_SPINNER_PID=""
-  fi
-  if [[ -n "${UI_SPINNER_STATUS_FILE:-}" && -f "${UI_SPINNER_STATUS_FILE:-}" ]]; then
-    rm -f "${UI_SPINNER_STATUS_FILE}" >/dev/null 2>&1 || true
-    UI_SPINNER_STATUS_FILE=""
+  if (( UI_IS_TTY )) && (( UI_DASHBOARD_INITIALIZED == 1 )); then
+    ui_progress_clear
   fi
 
   if [[ -n "${ISO_MOUNT:-}" && -d "${ISO_MOUNT:-}" ]]; then
@@ -578,7 +677,9 @@ trap cleanup EXIT
 # ---------------------------------------------------------------------------------------------
 # Step 1: validate quickly (visible UX checkpoint)
 # ---------------------------------------------------------------------------------------------
-ui__println "$(ui__step_label 1) Validating inputs - done"
+ui_progress_init
+ui_live_start 1 "Validating inputs"
+ui_live_stop_ok 1 "Validating inputs"
 
 # ---------------------------------------------------------------------------------------------
 # Step 2/3: dependencies
@@ -694,7 +795,7 @@ set +e
       if [[ "$line" =~ ([0-9.]+[KMG]B/s) ]]; then RSYNC_SPEED="${BASH_REMATCH[1]}"; fi
 
       if [[ "$line" =~ xfr# && "$line" =~ to-check= ]]; then
-        ui_live_set "Copying ISO files - file ${RSYNC_CUR}/${RSYNC_TOTAL} - ${RSYNC_SPEED} - ${RSYNC_PCT}"
+        ui_live_set "Copying ISO files - ${RSYNC_CUR}/${RSYNC_TOTAL} - ${RSYNC_SPEED} - ${RSYNC_PCT}"
       fi
     done
 RSYNC_RC="${PIPESTATUS[0]}"
@@ -722,7 +823,7 @@ if [[ -f "${ISO_MOUNT}/sources/install.wim" ]]; then
     | tr '\r' '\n' \
     | while IFS= read -r line; do
         if [[ "$line" =~ ([0-9]{1,3})% ]]; then
-          ui_live_set "Splitting install.wim - ${BASH_REMATCH[1]}%"
+          ui_live_set "${BASH_REMATCH[1]}%"
         fi
       done
   WIMLIB_RC="${PIPESTATUS[0]}"
@@ -754,7 +855,7 @@ elif [[ -f "${ISO_MOUNT}/sources/install.esd" ]]; then
         if [[ "$line" =~ ([0-9.]+[KMG]B/s) ]]; then RSYNC_SPEED="${BASH_REMATCH[1]}"; fi
 
         if [[ "$line" =~ xfr# && "$line" =~ to-check= ]]; then
-          ui_live_set "Copying install.esd - file ${RSYNC_CUR}/${RSYNC_TOTAL} - ${RSYNC_SPEED} - ${RSYNC_PCT}"
+          ui_live_set "${RSYNC_CUR}/${RSYNC_TOTAL} - ${RSYNC_SPEED} - ${RSYNC_PCT}"
         fi
       done
   ESD_RC="${PIPESTATUS[0]}"
@@ -784,6 +885,8 @@ ISO_MOUNT=""
 # Step 12: eject USB
 # ---------------------------------------------------------------------------------------------
 run_quiet_step 12 "Ejecting USB" "${LOG_DIR}/eject.log" diskutil eject "${USB_DEV}"
+
+ui_progress_clear
 
 ui__println ""
 ui__println "Done. Your Windows 11 installer USB is ready."
